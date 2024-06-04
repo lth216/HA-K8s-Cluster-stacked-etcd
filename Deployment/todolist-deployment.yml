@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: todolist
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: todolist-dpl
+  namespace: todolist
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: todolist
+  template:
+    metadata:
+      labels:
+        app: todolist
+    spec:
+      containers:
+        - name: todolist-app
+          image: longtruong2106/todolist:0.0.1
+          ports:
+            - containerPort: 80
+          livenessProbe:
+            initialDelaySeconds: 10
+            httpGet:
+              path: /
+              port: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: todolist-svc
+  namespace: todolist
+spec:
+  selector:
+    app: todolist
+  ports:
+    - port: 80
+      targetPort: 80
+  type: LoadBalancer
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: todolist-ingress
+  namespace: todolist
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: longtruong-todolist.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: todolist-svc
+            port:
+              number: 80
