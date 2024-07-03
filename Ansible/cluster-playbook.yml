@@ -1,0 +1,240 @@
+- name: Install dependencies for K8s cluster
+  hosts: all_hosts
+  become: true
+  vars:
+    KUBERNETES_VERSION: v1.30
+    OS: xUbuntu_20.04
+    VERSION: 1.27
+  tasks:
+    - name: Install dependencies for K8s
+      apt:
+        update_cache: yes
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+          - software-properties-common
+        state: present
+
+    - name: Disable swapfile on host
+      shell: swapoff -a
+
+    - name: Remove swap in /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: swap
+        state: absent
+
+    - name: Enable overlay UFS and bridge network traffic
+      shell: |
+        modprobe overlay && modprobe br_netfilter
+
+    - name: Enable iptable for bridge network communication
+      shell: |
+        sudo tee /etc/sysctl.d/kubernetes.conf <<EOF
+        net.bridge.bridge-nf-call-ip6tables = 1
+        net.bridge.bridge-nf-call-iptables = 1
+        net.ipv4.ip_forward = 1
+        EOF
+
+    - name: Read all values from system directories
+      shell: sysctl --system
+
+    - name: Get first GPG key of CRI-O
+      apt_key:
+        url: https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/{{ VERSION }}/{{ OS }}/Release.key
+        state: present
+
+    - name: Get second GPG key of CRI-O
+      apt_key:
+        url: https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/{{ OS }}/Release.key
+        state: present
+
+    - name: Add first CRI-O key to apt source list
+      apt_repository:
+        repo: deb http://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/{{ VERSION }}/{{ OS }}/ /
+        state: present
+        filename: devel:kubic:libcontainers:stable:cri-o:{{ VERSION }}.list
+    
+    - name: Add second CRI-O key to apt source list
+      apt_repository:
+        repo: deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/{{ OS }}/ /
+        state: present
+        filename: devel:kubic:libcontainers:stable.list
+
+    - name: Install CRI-O container runtime interface
+      apt:
+        update_cache: yes
+        name:
+          - cri-o
+          - cri-o-runc
+
+    - name: Find bridge configuration file of CRI-O
+      find:
+        paths: /etc/cni/net.d/
+        recurse: yes
+        patterns: '.*crio.*\.conflist'
+        use_regex: yes
+      register: conflist_file
+
+    - name: Update Pod CIDR for the CRI-O
+      lineinfile:
+        path: /etc/cni/net.d/{{ conflist_file.files[0].path }}
+        regexp: "10.85.0.0"
+        line: 172.24.0.0
+
+    - name: Reload systemd daemon to read all unit configuration
+      systemd:
+        daemon-reload: yes
+
+    - name: Restart and enable CRI-O service
+      service:
+        name: crio
+        state: started
+        enabled: yes
+
+    - name: Get GPG key of K8s
+      apt_key:
+        url: https://pkgs.k8s.io/core:/stable:/{{ KUBERNETES_VERSION }}/deb/Release.key
+        keyring: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        state: present
+
+    - name: Add GPG key of K8s to apt source list
+      apt_repository:
+        repo: deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ KUBERNETES_VERSION }}/deb/ /
+        state: present
+        filename: kubernetes.list
+
+    - name: Install kubeadm, kubelet and kubectl
+      apt:
+        update_cache: yes
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+
+    - name: Start kubelet service
+      service:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    - name: Pull components of K8s cluster
+      shell: kubeadm config images pull --cri-socket unix:///var/run/crio/crio.sock
+
+- name: Init cluster on master-node-1
+  hosts: master-node-1
+  become: true
+  become_user: root
+  vars:
+    cluster_virtual_ip: 192.168.1.26
+    pod_cidr: 172.24.0.0/16
+    calico_version: v3.28.0
+  tasks:
+    - name: Reset existing cluster
+      shell: kubeadm reset -f --cri-socket unix:///var/run/crio/crio.sock
+
+    - name: Init cluster
+      shell: |
+        kubeadm init --control-plane-endpoint={{ cluster_virtual_ip }}:6443 \
+          --apiserver-advertise-address={{ ansible_default_ipv4.address }} \
+          --pod-network-cidr {{ pod_cidr }} \
+          --upload-certs \
+          --cri-socket unix:///var/run/crio/crio.sock
+      delegate_to: "{{ ansible_default_ipv4.address }}"
+
+    - name: Pause for 1 minute to init cluster
+      pause:
+        minutes: 1
+
+    - name: Download custom resources configuration file of Calico
+      get_url:
+        url: https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/custom-resources.yaml
+        dest: /tmp/custom-resources.yaml
+        mode: '0755'
+
+    - name: Replace pod_cidr in custom resource configuration file of Calico
+      lineinfile:
+        path: /tmp/custom-resources.yaml
+        regexp: '^(\s*)cidr:.*'
+        line: '\1cidr: {{ pod_cidr }}'
+        backrefs: yes
+        state: present
+
+    - name: Store authentication for kubetcl at home directory
+      shell: |
+        rm -rf ~/.kube || true
+        mkdir -p ~/.kube
+        cp -i /etc/kubernetes/admin.conf ~/.kube/config
+        chown root. ~/.kube/config
+        chmod 600 ~/.kube/config
+
+    - name: Install Tigera Operator
+      shell: |
+        kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml
+
+    - name: Pause for 15 seconds for starting Tigera Operator Pods
+      pause:
+        seconds: 15
+
+    - name: Install Calico CNI with custom resources
+      shell: |
+        kubectl create -f /tmp/custom-resources.yaml
+
+- name: Join master and worker nodes to cluster
+  hosts: master_nodes, worker_nodes
+  become: yes
+  become_user: root
+  tasks:
+    - name: Print join command
+      shell: kubeadm token create --print-join-command
+      register: kubeadm_join_command
+      run_once: yes
+      delegate_to: master-node-1
+
+    - name: Print certificates
+      shell: kubeadm init phase upload-certs --upload-certs
+      register: kubeadm_upload_cert
+      run_once: yes
+      delegate_to: master-node-1
+
+    - name: Open port 2379 for etcd
+      ufw:
+        rule: allow
+        port: 2379
+        protocol: TCP
+
+    - name: Open port 2380 for etcd
+      ufw:
+        rule: allow
+        port: 2380
+        protocol: TCP
+
+    - name: Reload UFW
+      command: ufw reload
+
+    - name: Join master nodes
+      when: 
+        - inventory_hostname != 'master-node-1'
+        - inventory_hostname not in groups['worker_nodes']
+      shell: |
+        {{ kubeadm_join_command.stdout }} --control-plane \
+            --certificate-key {{ kubeadm_upload_cert.stdout_lines[2] }} \
+            --apiserver-advertise-address {{ ansible_default_ipv4.address }} \
+            --cri-socket unix:///var/run/crio/crio.sock
+
+    - name: Join worker nodes
+      when: 
+        - inventory_hostname not in groups['master_nodes']
+      shell: |
+        {{ kubeadm_join_command.stdout }} \
+              --certificate-key {{ kubeadm_upload_cert.stdout_lines[2] }} \
+              --apiserver-advertise-address {{ ansible_default_ipv4.address }} \
+              --cri-socket unix:///var/run/crio/crio.sock
+    
+    - name: Restart kubelet service
+      service:
+        name: kubelet
+        daemon-reload: yes
+        state: restarted

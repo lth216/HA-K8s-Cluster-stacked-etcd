@@ -1,0 +1,119 @@
+- name: Setup HAProxy and Keepalived
+  hosts: loadbalancers
+  become: yes
+  tasks:
+    - name: Install HAProxy and Keepalived
+      apt:
+        update_cache: yes
+        name:
+            - haproxy
+            - keepalived
+
+    - name: Configure HAProxy
+      when:
+        - inventory_hostname in groups['loadbalancers']
+      shell: |
+        sudo tee /etc/haproxy/haproxy.cfg <<-EOF
+        listen stats
+            bind *:8404
+            mode http
+            log global
+            stats enable
+            stats uri /stats
+            stats show-node
+            stats refresh 10s
+
+        frontend kubernetes-frontend
+            bind *:6443
+            mode tcp
+            option tcplog
+            default_backend kubernetes-backend
+
+        backend kubernetes-backend
+            option httpchk GET /healthz
+            http-check expect status 200
+            mode tcp
+            option ssl-hello-chk
+            timeout connect 10s
+            timeout client 30s
+            timeout server 30s
+            balance roundrobin
+                server master-node-1 {{ hostvars['master-node-1'].ansible_default_ipv4.address }}:6443 check fall 3 rise 2
+                server master-node-2 {{ hostvars['master-node-2'].ansible_default_ipv4.address }}:6443 check fall 3 rise 2
+                server master-node-3 {{ hostvars['master-node-3'].ansible_default_ipv4.address }}:6443 check fall 3 rise 2
+
+    - name: Restart HAProxy
+      service:
+        name: haproxy
+        daemon-reload: yes
+        state: restarted
+
+    - name: Configure Keepalived MASTER
+      when:
+        - inventory_hostname == "k8s-lb-1"
+      shell: |
+        sudo tee /etc/keepalived/keepalived.conf <<-EOF
+        global_defs {
+            router_id {{ inventory_hostname }}
+        }
+        vrrp_script chk_haproxy {
+            script "killall -0 haproxy"
+            interval 2
+            weight 2
+        }
+        vrrp_instance VI_1 {
+            virtual_router_id 51
+            advert_int 1
+            priority 100
+            state MASTER
+            interface ens33
+            virtual_ipaddress {
+                192.168.1.26 dev ens33
+            }
+            authentication {
+                auth_type PASS
+                auth_pass 123456
+            }
+            track_script {
+                chk_haproxy
+            }
+        }
+        EOF
+
+    - name: Configuree Keepalived BACKUP
+      when:
+        - inventory_hostname == "k8s-lb-2"
+      shell: |
+        sudo tee /etc/keepalived/keepalived.conf <<-EOF
+        global_defs {
+            router_id {{ inventory_hostname }}
+        }
+        vrrp_script chk_haproxy {
+            script "killall -0 haproxy"
+            interval 2
+            weight 2
+        }
+        vrrp_instance VI_1 {
+            virtual_router_id 51
+            advert_int 1
+            priority 99
+            state BACKUP
+            interface ens33
+            virtual_ipaddress {
+                192.168.1.26 dev ens33
+            }
+            authentication {
+                auth_type PASS
+                auth_pass 123456
+            }
+            track_script {
+                chk_haproxy
+            }
+        }
+        EOF
+
+    - name: Restart Keepalived
+      service:
+        name: keepalived
+        daemon-reload: yes
+        state: restarted
